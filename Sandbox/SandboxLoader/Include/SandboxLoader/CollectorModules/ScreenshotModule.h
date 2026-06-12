@@ -54,8 +54,16 @@ public:
         std::wcout << L"[ScreenshotModule] Timer set every "
                    << m_intervalMs / 1000 << L" s\n";
 
-        
-        SetWindowsHookExA(WH_CBT , HookScreenShot, nullptr , 0);
+        m_hWinEvent = ::SetWinEventHook(EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,   // last  event in range
+            NULL,                      // hModWndProcDll — NULL = in-process delivery
+            WinHookScreenShot,              // our callback
+            0,                         // any process
+            0,                         // any thread
+            WINEVENT_OUTOFCONTEXT      // deliver via message queue, no DLL required
+            | WINEVENT_SKIPOWNPROCESS);
+
+        /*SetWindowsHookExA(WH_CBT , HookScreenShot, nullptr , 0);*/
 
         // Take an immediate screenshot so we don't wait for the first tick.
         TakeScreenshot();
@@ -76,13 +84,19 @@ public:
     void OnDestroy(HWND hwnd) override
     {
         ::KillTimer(hwnd, TIMER_ID);
+        if (m_hWinEvent)
+        {
+            ::UnhookWinEvent(m_hWinEvent);
+            m_hWinEvent = nullptr;
+        }
     }
 
 private:
     static constexpr UINT_PTR TIMER_ID = 1001; // unique ID for this module's timer
     UINT m_intervalMs;
+    HWINEVENTHOOK m_hWinEvent = nullptr;
 
-    // ── Timestamp helper ─────────────────────────────────────────────────────
+    
     static std::wstring Timestamp()
     {
         std::time_t t = std::time(nullptr);
@@ -185,8 +199,20 @@ private:
         ::ReleaseDC(nullptr, hdcScreen);
     }
 
+    static void CALLBACK WinHookScreenShot(
+        HWINEVENTHOOK /*hWinEventHook*/,
+        DWORD         /*event*/,
+        HWND          hwnd,
+        LONG          /*idObject*/,
+        LONG          /*idChild*/,
+        DWORD         /*dwEventThread*/,
+        DWORD         /*dwmsEventTime*/)
+    {
+           TakeScreenshot();
+    }
 
-    static LRESULT CALLBACK HookScreenShot(int ncode, WPARAM wParam, LPARAM lparam)
+
+    /*static LRESULT CALLBACK HookScreenShot(int ncode, WPARAM wParam, LPARAM lparam)
     {
         if (ncode >= 0)
         {
@@ -199,6 +225,6 @@ private:
         }
         return CallNextHookEx(nullptr, ncode, wParam, lparam);
 
-    }
+    }*/
     
 };
