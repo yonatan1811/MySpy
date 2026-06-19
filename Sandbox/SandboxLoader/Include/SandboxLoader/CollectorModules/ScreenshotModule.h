@@ -1,5 +1,16 @@
 #pragma once
+
 #define NOMINMAX
+
+#include "SandboxLoader/Modules/IModule.h"
+#include "SandboxLoader/Containers/SshotContainer.h"
+
+// miniz: single-header zlib-compatible compression, no install required.
+// We include the .c directly here so there is no separate compilation unit.
+// In a real project you would add miniz.c to the project's source list instead.
+#define MINIZ_NO_STDIO
+#define MINIZ_NO_ARCHIVE_APIS
+#include "SandboxLoader/Dependencies/miniz.h"
 
 #include <string>
 #include <sstream>
@@ -8,61 +19,67 @@
 #include <iostream>
 #include <vector>
 #include <algorithm>
+#include <cstring>
 
-#include "SandboxLoader/Modules/IModule.h"
-
+#include <wincodec.h>
 #include <shlwapi.h>
-#include <wincodec.h> 
-#include <wincodecsdk.h>
 #pragma comment(lib, "windowscodecs.lib")
-#pragma comment(lib , "Shlwapi.lib")
+#pragma comment(lib, "shlwapi.lib")
 
 #undef min
 #undef max
 
-
-
 // ─────────────────────────────────────────────────────────────────────────────
-// ScreenshotModule  —  GDI capture + WIC encode
+// ScreenshotModule  —  GDI capture + XOR delta + zlib + .sshot v2
 //
-// WHY WIC INSTEAD OF GDI+?
-// ─────────────────────────
-// GDI+ is frozen at version 1.1 (released ~2006). WIC is the API Microsoft
-// replaced it with, and is actively maintained as part of Windows.
+// PER-FRAME PIPELINE
+// ───────────────────
 //
-// Concrete advantages WIC gives us here:
-//   • Better PNG compression — WIC's PNG encoder uses a higher default
-//     DEFLATE effort than GDI+'s, typically 10–20% smaller files.
-//   • Proper palette/quantization pipeline — WIC has first-class support
-//     for palette generation and ordered/error-diffusion dithering via
-//     IWICPalette, without needing the undocumented GdipInitializePalette.
-//   • COM-based, composable — each step (source → transform → encoder)
-//     is a distinct COM interface. Easy to swap in a JPEG or TIFF encoder
-//     by changing one GUID.
-//   • Actively updated — new formats (HEIF, AVIF via codec packs) are
-//     added to WIC, never to GDI+.
+//  Every frame:
+//   1. GDI BitBlt → raw 24-bit BGR screen pixels (same as always)
+//   2. Delta detect → dirty bounding rect  (unchanged)
+//   3. Extract crop as top-down RGB buffer  (unchanged, flip Y + swap BGR→RGB)
 //
-// WIC COM OBJECT MODEL (what we use)
-// ────────────────────────────────────
-//   IWICImagingFactory          — the root factory, created once
-//     └─ CreateBitmapFromMemory → IWICBitmap          (wraps our raw pixels)
-//     └─ CreateEncoder          → IWICBitmapEncoder   (PNG encoder)
-//          └─ CreateNewFrame    → IWICBitmapFrameEncode (one image frame)
-//     └─ CreatePalette          → IWICPalette          (256-color table)
+//  Keyframe (every KEYFRAME_INTERVAL frames, or first frame):
+//   4K. WIC JPEG-encode the crop → payload
+//   5K. Write FrameHeader(KEYFRAME) + payload to .sshot
+//   6K. Paint crop onto m_canvas at (crop_x, crop_y)
 //
-// PIPELINE (same three layers as before, WIC replaces GDI+ in layers 3+4)
-// ─────────────────────────────────────────────────────────────────────────
-//   GDI BitBlt          → raw 24-bit BGR pixels in memory
-//   Delta detection     → dirty bounding rect (or skip if no change)
-//   WIC IWICBitmap      → wrap the cropped pixels, convert BGR→RGB
-//   IWICPalette         → derive optimal 256-color palette from the bitmap
-//   IWICBitmapFrameEncode→ write palette + dithered pixels into PNG frame
-//   IStream (file)      → output .png file
+//  Delta frame:
+//   4D. XOR crop pixels against m_canvas at (crop_x, crop_y)
+//          xor_buf[i] = crop_rgb[i] ^ canvas_rgb[(crop_y+y)*W + (crop_x+x)]
+//       Result: zeros where nothing changed, signal only where pixels differ.
+//   5D. zlib-compress xor_buf → payload  (MZ_BEST_COMPRESSION level 9)
+//   6D. Write FrameHeader(DELTA) + payload to .sshot
+//   7D. Apply XOR to m_canvas to advance it to current state
+//          canvas_rgb[...] ^= xor_buf[...]
+//
+// WHY XOR INSTEAD OF SUBTRACT?
+// ─────────────────────────────
+// XOR is its own inverse: decode is identical to encode (just XOR again).
+// No clamping, no sign handling, no overflow — a single operation for both
+// encode and decode.  The tradeoff vs subtract is that XOR doesn't produce
+// smooth gradients in the diff, but for screen content (sharp pixel changes)
+// it compresses just as well under zlib because unchanged pixels are
+// exactly 0x00 regardless of the mathematical operation used.
+//
+// CANVAS MODEL
+// ─────────────
+// m_canvas is a full-screen top-down RGB buffer (W * H * 3 bytes).
+// It always holds the reconstructed state of the last committed frame.
+// The Python parser maintains an identical canvas during reconstruction.
+// They stay in sync because both apply the same XOR operations in the
+// same order.
+//
+// SIZE EXPECTATIONS
+// ──────────────────
+// Keyframe:  JPEG quality 55 of dirty crop → 20–80 KB
+// Delta:     zlib of XOR buffer where most bytes are 0x00
+//            → user typing in one window: 0.5–5 KB
+//            → window drag/animation:     5–30 KB
+//            → full screen change:        ~same as keyframe (worst case)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ── Smart pointer helpers for COM objects ────────────────────────────────────
-// We use a minimal RAII wrapper so we don't need to #include <wrl/client.h>
-// (which pulls in a lot of headers). For a real project, prefer ComPtr<T>.
 template<typename T>
 struct ComPtr
 {
@@ -71,7 +88,6 @@ struct ComPtr
     T** operator&() { return &p; }
     T* operator->() { return p; }
     operator T* () { return p; }
-    // Disable copy — these are move-only resources
     ComPtr() = default;
     ComPtr(const ComPtr&) = delete;
     ComPtr& operator=(const ComPtr&) = delete;
@@ -80,8 +96,9 @@ struct ComPtr
 class ScreenshotModule : public IModule
 {
 public:
-    explicit ScreenshotModule(UINT intervalSeconds = 30)
+    explicit ScreenshotModule(UINT intervalSeconds = 30, UINT jpegQuality = 55)
         : m_intervalMs(intervalSeconds * 1000)
+        , m_jpegQuality(jpegQuality)
     {}
 
     std::wstring Name() const override { return L"ScreenshotModule"; }
@@ -92,48 +109,42 @@ public:
     {
         s_instance = this;
 
-        // WIC lives in the COM ecosystem — CoInitialize must be called on this
-        // thread before any COM object can be created.
-        // COINIT_APARTMENTTHREADED matches a single-threaded message-loop thread.
         HRESULT hr = ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-        m_comInitialised = SUCCEEDED(hr) || hr == S_FALSE; // S_FALSE = already init
+        m_comInit = SUCCEEDED(hr) || hr == S_FALSE;
 
-        // Create the WIC factory — this is the entry point for everything WIC.
-        // CLSID_WICImagingFactory is the concrete class; IID_IWICImagingFactory
-        // is the interface we want back.
-        hr = ::CoCreateInstance(
-            CLSID_WICImagingFactory, nullptr,
-            CLSCTX_INPROC_SERVER,
-            IID_IWICImagingFactory,
-            reinterpret_cast<void**>(&m_wicFactory));
+        hr = ::CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+            CLSCTX_INPROC_SERVER, IID_IWICImagingFactory,
+            reinterpret_cast<void**>(&m_factory));
 
         if (FAILED(hr))
         {
-            std::cerr << "[ScreenshotModule] CoCreateInstance(WICFactory) failed, hr="
+            std::cerr << "[ScreenshotModule] WIC init failed hr="
                 << std::hex << hr << "\n";
             return;
         }
-        std::wcout << L"[ScreenshotModule] WIC factory ready\n";
 
-        // Periodic timer
+        ::CreateDirectoryW(LR"(C:\tmp)", nullptr);
+        InitArchive();
+
         ::SetTimer(hwnd, TIMER_ID, m_intervalMs, nullptr);
-        std::wcout << L"[ScreenshotModule] Timer=" << m_intervalMs / 1000 << L"s\n";
 
-        // Foreground-change hook — WINEVENT_OUTOFCONTEXT means Windows delivers
-        // events via our message queue, no DLL injection required.
         m_hWinEvent = ::SetWinEventHook(
             EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
             nullptr, WinEventProc, 0, 0,
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
-        CaptureAndSave(L"startup");
+        std::wcout << L"[ScreenshotModule] Ready. Archive=" << m_archivePath
+            << L" quality=" << m_jpegQuality
+            << L" keyframe-every=" << KEYFRAME_INTERVAL << L"\n";
+
+        CaptureAndAppend();
     }
 
-    bool OnMessage(HWND /*hwnd*/, UINT uMsg, WPARAM wParam, LPARAM /*lParam*/) override
+    bool OnMessage(HWND, UINT uMsg, WPARAM wParam, LPARAM) override
     {
         if (uMsg == WM_TIMER && wParam == TIMER_ID)
         {
-            CaptureAndSave(L"timer");
+            CaptureAndAppend();
             return true;
         }
         return false;
@@ -142,66 +153,92 @@ public:
     void OnDestroy(HWND hwnd) override
     {
         ::KillTimer(hwnd, TIMER_ID);
-
         if (m_hWinEvent) { ::UnhookWinEvent(m_hWinEvent); m_hWinEvent = nullptr; }
-
-        delete[] m_prevPixels;
-        m_prevPixels = nullptr;
-
-        // Release COM objects before CoUninitialize
-        if (m_wicFactory.p) { m_wicFactory.p->Release(); m_wicFactory.p = nullptr; }
-
-        if (m_comInitialised)
-            ::CoUninitialize();
-
+        delete[] m_prevPixels; m_prevPixels = nullptr;
+        delete[] m_canvas;     m_canvas = nullptr;
+        if (m_factory.p) { m_factory.p->Release(); m_factory.p = nullptr; }
+        if (m_comInit) ::CoUninitialize();
         s_instance = nullptr;
     }
 
 private:
     static constexpr UINT_PTR TIMER_ID = 1001;
 
-    UINT              m_intervalMs;
-    bool              m_comInitialised = false;
-    ComPtr<IWICImagingFactory> m_wicFactory;
-    HWINEVENTHOOK     m_hWinEvent = nullptr;
+    UINT      m_intervalMs;
+    UINT      m_jpegQuality;
+    bool      m_comInit = false;
+    ComPtr<IWICImagingFactory> m_factory;
+    HWINEVENTHOOK m_hWinEvent = nullptr;
 
-    // Previous frame for delta detection
+    std::wstring m_archivePath = LR"(C:\tmp\monitor.sshot)";
+
+    // GDI capture buffer (bottom-up BGR from GetDIBits)
     BYTE* m_prevPixels = nullptr;
     int   m_prevW = 0, m_prevH = 0;
 
+    // Reconstructed canvas — top-down RGB, full screen, mirrors parser state
+    BYTE* m_canvas = nullptr;
+    int   m_canvasW = 0;
+    int   m_canvasH = 0;
+
+    uint32_t m_frameCount = 0; // total frames written (drives keyframe schedule)
+
     static ScreenshotModule* s_instance;
 
-    // ── Foreground hook callback ───────────────────────────────────────────────
+    // ── Foreground hook ───────────────────────────────────────────────────────
     static void CALLBACK WinEventProc(
-        HWINEVENTHOOK, DWORD, HWND hwnd,
-        LONG, LONG, DWORD, DWORD)
+        HWINEVENTHOOK, DWORD, HWND hwnd, LONG, LONG, DWORD, DWORD)
     {
-        if (s_instance)
+        if (!s_instance) return;
+        wchar_t t[256] = {};
+        ::GetWindowTextW(hwnd, t, 256);
+        std::wcout << L"[ScreenshotModule] Foreground → \"" << t << L"\"\n";
+        s_instance->CaptureAndAppend();
+    }
+
+    // ── Archive init ──────────────────────────────────────────────────────────
+    void InitArchive()
+    {
+        DWORD attr = ::GetFileAttributesW(m_archivePath.c_str());
+        if (attr != INVALID_FILE_ATTRIBUTES)
         {
-            wchar_t title[256] = {};
-            ::GetWindowTextW(hwnd, title, 256);
-            std::wcout << L"[ScreenshotModule] Foreground → \"" << title << L"\"\n";
-            s_instance->CaptureAndSave(L"fg");
+            // Count existing frames so keyframe schedule continues correctly
+            m_frameCount = ReadExistingCount();
+            std::wcout << L"[ScreenshotModule] Appending to existing archive ("
+                << m_frameCount << L" frames)\n";
+            return;
         }
+
+        HANDLE hf = ::CreateFileW(m_archivePath.c_str(), GENERIC_WRITE, 0,
+            nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hf == INVALID_HANDLE_VALUE) return;
+
+        SshotFileHeader fh{};
+        DWORD w{};
+        ::WriteFile(hf, &fh, sizeof(fh), &w, nullptr);
+        ::CloseHandle(hf);
+        std::wcout << L"[ScreenshotModule] Created archive: " << m_archivePath << L"\n";
     }
 
-    // ── Timestamp ─────────────────────────────────────────────────────────────
-    static std::wstring Timestamp()
+    uint32_t ReadExistingCount()
     {
-        std::time_t t = std::time(nullptr);
-        std::tm tm{};
-        localtime_s(&tm, &t);
-        std::wostringstream ss;
-        ss << std::put_time(&tm, L"%Y%m%d_%H%M%S");
-        return ss.str();
+        HANDLE hf = ::CreateFileW(m_archivePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hf == INVALID_HANDLE_VALUE) return 0;
+        uint32_t count = 0;
+        ::SetFilePointer(hf, SSHOT_COUNT_OFFSET, nullptr, FILE_BEGIN);
+        DWORD r{};
+        ::ReadFile(hf, &count, sizeof(count), &r, nullptr);
+        ::CloseHandle(hf);
+        return count;
     }
 
-    // ── Master pipeline ───────────────────────────────────────────────────────
-    void CaptureAndSave(const std::wstring& reason)
+    // ── Master capture pipeline ───────────────────────────────────────────────
+    void CaptureAndAppend()
     {
-        if (!m_wicFactory.p) return;
+        if (!m_factory.p) return;
 
-        // ── STEP 1: GDI full-screen capture → raw pixel buffer ────────────────
+        // ── STEP 1: GDI full-screen capture ───────────────────────────────────
         const int W = ::GetSystemMetrics(SM_CXSCREEN);
         const int H = ::GetSystemMetrics(SM_CYSCREEN);
 
@@ -211,20 +248,12 @@ private:
         HBITMAP hOld = static_cast<HBITMAP>(::SelectObject(hdcMem, hBmp));
         ::BitBlt(hdcMem, 0, 0, W, H, hdcScreen, 0, 0, SRCCOPY);
 
-        // GetDIBits reads pixels in BGR order, bottom-up (standard DIB format).
-        // stride is padded to 4-byte alignment per BMP spec.
         BITMAPINFOHEADER bi{};
-        bi.biSize = sizeof(bi);
-        bi.biWidth = W;
-        bi.biHeight = H;       // positive = bottom-up
-        bi.biPlanes = 1;
-        bi.biBitCount = 24;      // BGR, no alpha
-        bi.biCompression = BI_RGB;
+        bi.biSize = sizeof(bi); bi.biWidth = W; bi.biHeight = H;
+        bi.biPlanes = 1; bi.biBitCount = 24; bi.biCompression = BI_RGB;
 
         const DWORD stride = ((W * 3 + 3) & ~3);
-        const DWORD totalBytes = stride * H;
-
-        std::vector<BYTE> cur(totalBytes);
+        std::vector<BYTE> cur(stride * H);
         ::GetDIBits(hdcMem, hBmp, 0, H, cur.data(),
             reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS);
 
@@ -233,7 +262,7 @@ private:
         ::DeleteDC(hdcMem);
         ::ReleaseDC(nullptr, hdcScreen);
 
-        // ── STEP 2: Delta detection → dirty bounding rect ─────────────────────
+        // ── STEP 2: Delta detection → dirty rect ──────────────────────────────
         RECT dirty = { W, H, 0, 0 };
         bool anyChange = false;
 
@@ -262,14 +291,14 @@ private:
             anyChange = true;
         }
 
-        // Store current frame as next "previous"
+        // Update GDI prev-frame buffer
         if (!m_prevPixels || m_prevW != W || m_prevH != H)
         {
             delete[] m_prevPixels;
-            m_prevPixels = new BYTE[totalBytes];
+            m_prevPixels = new BYTE[stride * H];
             m_prevW = W; m_prevH = H;
         }
-        std::memcpy(m_prevPixels, cur.data(), totalBytes);
+        std::memcpy(m_prevPixels, cur.data(), stride * H);
 
         if (!anyChange)
         {
@@ -277,186 +306,248 @@ private:
             return;
         }
 
+        // Ensure canvas is allocated (full-screen top-down RGB)
+        if (!m_canvas || m_canvasW != W || m_canvasH != H)
+        {
+            delete[] m_canvas;
+            m_canvas = new BYTE[W * H * 3]();  // zero-initialised
+            m_canvasW = W; m_canvasH = H;
+            // Force a keyframe whenever canvas is (re-)allocated
+            m_frameCount = 0;
+        }
+
         const int cropW = dirty.right - dirty.left;
         const int cropH = dirty.bottom - dirty.top;
-        std::wcout << L"[ScreenshotModule] Dirty " << cropW << L"x" << cropH
-            << L" [" << reason << L"]\n";
 
-        // ── STEP 3: Build a top-down RGB buffer of the dirty crop ─────────────
-        // WIC expects:
-        //   • Top-down row order  (DIB is bottom-up → we flip Y)
-        //   • RGB byte order      (DIB is BGR      → we swap R and B)
-        //
-        // We produce a tightly-packed buffer (no row padding) because WIC's
-        // CreateBitmapFromMemory accepts an explicit stride parameter.
-
-        const UINT wicStride = cropW * 3; // 3 bytes/pixel, no padding needed
-        std::vector<BYTE> rgb(wicStride * cropH);
+        // ── STEP 3: Build top-down RGB crop (flip Y, swap BGR→RGB) ────────────
+        // Layout: tightly packed, cropW*3 bytes per row, no padding.
+        const int rgbStride = cropW * 3;
+        std::vector<BYTE> cropRgb(rgbStride * cropH);
 
         for (int y = 0; y < cropH; ++y)
         {
-            // Flip Y: DIB row 0 = screen bottom, so screen row (dirty.top + y)
-            // is stored at DIB row (H - 1 - (dirty.top + y))
+            // DIB is bottom-up: screen row (dirty.top+y) is at DIB row (H-1-(dirty.top+y))
             int dibY = (H - 1) - (dirty.top + y);
             const BYTE* src = cur.data() + dibY * stride + dirty.left * 3;
-            BYTE* dst = rgb.data() + y * wicStride;
-
+            BYTE* dst = cropRgb.data() + y * rgbStride;
             for (int x = 0; x < cropW; ++x)
             {
-                // Swap BGR → RGB
-                dst[x * 3 + 0] = src[x * 3 + 2]; // R ← B slot
-                dst[x * 3 + 1] = src[x * 3 + 1]; // G ← G slot
-                dst[x * 3 + 2] = src[x * 3 + 0]; // B ← R slot
+                dst[x * 3 + 0] = src[x * 3 + 2]; // R ← B
+                dst[x * 3 + 1] = src[x * 3 + 1]; // G
+                dst[x * 3 + 2] = src[x * 3 + 0]; // B ← R
             }
         }
 
-        // ── STEP 4: Wrap pixels in a WIC bitmap ───────────────────────────────
-        // IWICBitmap is WIC's in-memory bitmap type.
-        // GUID_WICPixelFormat24bppRGB matches our 3-bytes-per-pixel RGB buffer.
-        ComPtr<IWICBitmap> wicBmp;
-        HRESULT hr = m_wicFactory->CreateBitmapFromMemory(
-            cropW, cropH,
-            GUID_WICPixelFormat24bppRGB,
-            wicStride,              // bytes per row
-            wicStride * cropH,      // total buffer size
-            rgb.data(),
-            &wicBmp);
+        // ── Decide frame type ─────────────────────────────────────────────────
+        bool isKeyframe = (m_frameCount % KEYFRAME_INTERVAL == 0);
 
-        if (FAILED(hr))
+        if (isKeyframe)
+            WriteKeyframe(cropRgb, dirty, cropW, cropH, W);
+        else
+            WriteDelta(cropRgb, dirty, cropW, cropH, W);
+
+        ++m_frameCount;
+    }
+
+    // ── KEYFRAME: JPEG-encode crop, paint onto canvas ─────────────────────────
+    void WriteKeyframe(const std::vector<BYTE>& cropRgb,
+        const RECT& dirty, int cropW, int cropH, int W)
+    {
+        // Encode crop to JPEG in memory
+        std::vector<BYTE> jpeg = EncodeJpeg(cropRgb, cropW, cropH);
+
+        // Paint crop onto canvas so delta frames can diff against it
+        PaintOntoCanvas(cropRgb, dirty, cropW, cropH, W);
+
+        // Append to archive
+        AppendFrame(jpeg.data(), (uint32_t)jpeg.size(),
+            dirty.left, dirty.top, cropW, cropH,
+            FRAME_TYPE_KEYFRAME);
+
+        std::wcout << L"[ScreenshotModule] KEYFRAME #" << m_frameCount
+            << L" " << cropW << L"x" << cropH
+            << L" → " << jpeg.size() / 1024 << L" KB\n";
+    }
+
+    // ── DELTA: XOR crop against canvas, zlib-compress ─────────────────────────
+    void WriteDelta(const std::vector<BYTE>& cropRgb,
+        const RECT& dirty, int cropW, int cropH, int W)
+    {
+        const int rgbStride = cropW * 3;
+        const int xorBufBytes = rgbStride * cropH;
+
+        // ── STEP 4D: XOR crop pixels against canvas ───────────────────────────
+        //
+        // Canvas is full-screen top-down RGB, stride = W*3 (no padding).
+        // For canvas pixel at screen position (dirty.left+x, dirty.top+y):
+        //   canvas_offset = (dirty.top + y) * W * 3 + (dirty.left + x) * 3
+        //
+        // xor_buf[y * cropW * 3 + x * 3 + ch]
+        //   = cropRgb[y * cropW * 3 + x * 3 + ch]
+        //   ^ canvas[(dirty.top+y)*W*3 + (dirty.left+x)*3 + ch]
+        //
+        // Pixels that didn't change → 0x00 in xor_buf.
+        // zlib sees long runs of zeros → extremely high compression ratio.
+
+        std::vector<BYTE> xorBuf(xorBufBytes);
+
+        for (int y = 0; y < cropH; ++y)
         {
-            std::cerr << "[ScreenshotModule] CreateBitmapFromMemory failed, hr="
-                << std::hex << hr << "\n";
+            const BYTE* crop = cropRgb.data() + y * rgbStride;
+            const BYTE* canvas = m_canvas
+                + (dirty.top + y) * m_canvasW * 3
+                + dirty.left * 3;
+            BYTE* xor_ = xorBuf.data() + y * rgbStride;
+
+            for (int b = 0; b < rgbStride; ++b)
+                xor_[b] = crop[b] ^ canvas[b];
+        }
+
+        // ── STEP 5D: zlib-compress the XOR buffer ─────────────────────────────
+        //
+        // mz_compress2 is miniz's one-shot zlib compression.
+        // MZ_BEST_COMPRESSION (level 9) maximises ratio at the cost of CPU.
+        // For a monitoring tool that runs in the background, this is fine.
+        //
+        // The compressed output is at most mz_compressBound(xorBufBytes) bytes.
+        // In practice for XOR-delta data it will be much smaller.
+
+        mz_ulong compBound = mz_compressBound((mz_ulong)xorBufBytes);
+        std::vector<BYTE> compressed(compBound);
+        mz_ulong compSize = compBound;
+
+        int mzResult = mz_compress2(
+            compressed.data(), &compSize,
+            xorBuf.data(), (mz_ulong)xorBufBytes,
+            MZ_BEST_COMPRESSION);
+
+        if (mzResult != MZ_OK)
+        {
+            std::cerr << "[ScreenshotModule] zlib compress failed: " << mzResult << "\n";
+            // Fall back to a keyframe on compress failure
+            WriteKeyframe(cropRgb, dirty, cropW, cropH, W);
+            return;
+        }
+        compressed.resize(compSize);
+
+        // ── STEP 6D: Update canvas ─────────────────────────────────────────────
+        // Apply the same XOR to advance the canvas to the current frame.
+        // After this, canvas matches the current screen state in the crop region.
+        PaintOntoCanvas(cropRgb, dirty, cropW, cropH, W);
+
+        // ── STEP 7D: Append to archive ─────────────────────────────────────────
+        AppendFrame(compressed.data(), (uint32_t)compressed.size(),
+            dirty.left, dirty.top, cropW, cropH,
+            FRAME_TYPE_DELTA);
+
+        std::wcout << L"[ScreenshotModule] DELTA    #" << m_frameCount
+            << L" " << cropW << L"x" << cropH
+            << L" raw=" << xorBufBytes / 1024 << L" KB"
+            << L" → " << compSize / 1024 << L" KB"
+            << L" (" << (100 * compSize / xorBufBytes) << L"% of raw)\n";
+    }
+
+    // ── Paint a crop into the canvas (used for both keyframe and delta) ────────
+    // After this call, canvas[dirty.top..dirty.bottom][dirty.left..dirty.right]
+    // reflects the current screen state in that region.
+    void PaintOntoCanvas(const std::vector<BYTE>& cropRgb,
+        const RECT& dirty, int cropW, int cropH, int /*W*/)
+    {
+        const int rgbStride = cropW * 3;
+        for (int y = 0; y < cropH; ++y)
+        {
+            const BYTE* src = cropRgb.data() + y * rgbStride;
+            BYTE* dst = m_canvas
+                + (dirty.top + y) * m_canvasW * 3
+                + dirty.left * 3;
+            std::memcpy(dst, src, rgbStride);
+        }
+    }
+
+    // ── JPEG encode via WIC (in-memory) ───────────────────────────────────────
+    std::vector<BYTE> EncodeJpeg(const std::vector<BYTE>& rgb, int w, int h)
+    {
+        ComPtr<IStream> mem;
+        ::CreateStreamOnHGlobal(nullptr, TRUE, &mem);
+
+        ComPtr<IWICBitmapEncoder>      enc;
+        ComPtr<IWICBitmapFrameEncode>  frame;
+        ComPtr<IPropertyBag2>          props;
+
+        m_factory->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &enc);
+        enc->Initialize(mem, WICBitmapEncoderNoCache);
+        enc->CreateNewFrame(&frame, &props);
+
+        // Set quality
+        PROPBAG2 pb{}; pb.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
+        VARIANT  vq{};  vq.vt = VT_R4;
+        vq.fltVal = static_cast<float>(m_jpegQuality) / 100.0f;
+        props->Write(1, &pb, &vq);
+
+        frame->Initialize(props);
+        frame->SetSize(w, h);
+        WICPixelFormatGUID fmt = GUID_WICPixelFormat24bppRGB;
+        frame->SetPixelFormat(&fmt);
+
+        ComPtr<IWICBitmap> bmp;
+        m_factory->CreateBitmapFromMemory(
+            w, h, GUID_WICPixelFormat24bppRGB,
+            w * 3, w * 3 * h,
+            const_cast<BYTE*>(rgb.data()), &bmp);
+
+        frame->WriteSource(bmp, nullptr);
+        frame->Commit();
+        enc->Commit();
+
+        HGLOBAL hg{};
+        ::GetHGlobalFromStream(mem, &hg);
+        SIZE_T  sz = ::GlobalSize(hg);
+        void* ptr = ::GlobalLock(hg);
+
+        std::vector<BYTE> out(static_cast<BYTE*>(ptr),
+            static_cast<BYTE*>(ptr) + sz);
+        ::GlobalUnlock(hg);
+        return out;
+    }
+
+    // ── Append one frame record to the .sshot file ────────────────────────────
+    void AppendFrame(const void* payload, uint32_t payloadSize,
+        int32_t x, int32_t y, int32_t w, int32_t h,
+        uint8_t frameType)
+    {
+        HANDLE hf = ::CreateFileW(m_archivePath.c_str(),
+            GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hf == INVALID_HANDLE_VALUE)
+        {
+            std::cerr << "[ScreenshotModule] Cannot open archive, GLE="
+                << ::GetLastError() << "\n";
             return;
         }
 
-        // ── STEP 5: 8-bit palette quantization via WIC ────────────────────────
-        //
-        // WIC PALETTE QUANTIZATION WALKTHROUGH
-        // ──────────────────────────────────────
-        // A) CreatePalette() — allocates an empty IWICPalette object.
-        //
-        // B) InitializeFromBitmap() — WIC scans the source bitmap's pixels and
-        //    builds an optimal N-color palette.  WICBitmapPaletteTypeFixedHalftone256
-        //    gives us 256 colors chosen to best represent this specific image
-        //    (as opposed to a fixed web-safe palette).
-        //    The last parameter (fAddTransparentColor=FALSE) skips alpha.
-        //
-        // C) CreateBitmapFromSourceRect() — not needed here; we already have a crop.
-        //
-        // D) The palette is passed to the frame encoder (step 6) which uses it
-        //    when converting 24bpp → 8bpp during the write.
+        // Seek to end, write FrameHeader + payload
+        ::SetFilePointer(hf, 0, nullptr, FILE_END);
 
-        ComPtr<IWICPalette> palette;
-        hr = m_wicFactory->CreatePalette(&palette);
-        if (FAILED(hr)) { std::cerr << "[ScreenshotModule] CreatePalette failed\n"; return; }
+        SshotFrameHeader fh{};
+        fh.timestamp = static_cast<int64_t>(std::time(nullptr));
+        fh.crop_x = x;  fh.crop_y = y;
+        fh.crop_w = w;  fh.crop_h = h;
+        fh.payload_size = payloadSize;
+        fh.frame_type = frameType;
 
-        // InitializeFromBitmap scans the pixels and fills the palette with the
-        // best 256 colors for this specific image (octree quantization internally).
-        hr = palette->InitializeFromBitmap(
-            wicBmp,   // source to sample colors from
-            256,      // max colors
-            FALSE);   // no transparent color slot
-        if (FAILED(hr)) { std::cerr << "[ScreenshotModule] Palette init failed\n"; return; }
+        DWORD written{};
+        ::WriteFile(hf, &fh, sizeof(fh), &written, nullptr);
+        ::WriteFile(hf, payload, payloadSize, &written, nullptr);
 
-        // ── STEP 6: Create the PNG encoder and write the file ─────────────────
-        //
-        // WIC ENCODER PIPELINE
-        // ──────────────────────
-        // IWICBitmapEncoder  — represents the file format (PNG in our case).
-        //   └─ IWICBitmapFrameEncode — represents one image frame inside the file.
-        //        PNG is single-frame; formats like TIFF/GIF can have multiple.
-        //
-        // The encoder writes directly to an IStream.
-        // SHCreateStreamOnFileEx opens a file-backed IStream — WIC handles
-        // all the buffering and flushing internally.
+        // Update count in file header
+        ::SetFilePointer(hf, SSHOT_COUNT_OFFSET, nullptr, FILE_BEGIN);
+        uint32_t count = 0; DWORD rd{};
+        ::ReadFile(hf, &count, sizeof(count), &rd, nullptr);
+        ++count;
+        ::SetFilePointer(hf, SSHOT_COUNT_OFFSET, nullptr, FILE_BEGIN);
+        ::WriteFile(hf, &count, sizeof(count), &written, nullptr);
 
-        ::CreateDirectoryW(LR"(C:\tmp\screenshots)", nullptr);
-        std::wstring path = LR"(C:\tmp\screenshots\shot_)"
-            + Timestamp() + L"_" + reason + L".png";
-
-        // Open a file stream for writing
-        ComPtr<IStream> stream;
-        hr = ::SHCreateStreamOnFileEx(
-            path.c_str(),
-            STGM_CREATE | STGM_WRITE | STGM_SHARE_EXCLUSIVE,
-            FILE_ATTRIBUTE_NORMAL,
-            TRUE,       // create if not exists
-            nullptr,
-            &stream);
-        if (FAILED(hr))
-        {
-            std::cerr << "[ScreenshotModule] SHCreateStreamOnFileEx failed, hr="
-                << std::hex << hr << "\n";
-            return;
-        }
-
-        // Create a PNG encoder bound to the stream
-        // GUID_ContainerFormatPng identifies PNG; swap for GUID_ContainerFormatJpeg
-        // or GUID_ContainerFormatBmp to switch formats with no other code changes.
-        ComPtr<IWICBitmapEncoder> encoder;
-        hr = m_wicFactory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
-        if (FAILED(hr)) { std::cerr << "[ScreenshotModule] CreateEncoder failed\n"; return; }
-
-        hr = encoder->Initialize(stream, WICBitmapEncoderNoCache);
-        if (FAILED(hr)) { std::cerr << "[ScreenshotModule] Encoder init failed\n"; return; }
-
-        // Create a frame (PNG has exactly one)
-        ComPtr<IWICBitmapFrameEncode> frame;
-        ComPtr<IPropertyBag2>         props;   // encoder properties (compression level etc.)
-        hr = encoder->CreateNewFrame(&frame, &props);
-        if (FAILED(hr)) { std::cerr << "[ScreenshotModule] CreateNewFrame failed\n"; return; }
-
-        // ── Optional: set PNG compression level via property bag ──────────────
-        // The PNG encoder exposes "InterlaceOption" and "FilterOption".
-        // Compression level is controlled via the underlying zlib and is not
-        // directly exposed; WIC uses a balanced default (~level 6).
-        // To get maximum compression you'd use a custom IWICBitmapEncoder
-        // backed by libpng — WIC's default is already better than GDI+'s.
-
-        hr = frame->Initialize(props);
-        if (FAILED(hr)) { std::cerr << "[ScreenshotModule] Frame init failed\n"; return; }
-
-        // Tell the frame our pixel dimensions
-        hr = frame->SetSize(cropW, cropH);
-        if (FAILED(hr)) { std::cerr << "[ScreenshotModule] SetSize failed\n"; return; }
-
-        // Set the output pixel format.
-        // WICPixelFormat8bppIndexed → 8-bit palettised (one byte per pixel).
-        // The frame will dither the 24bpp source down to 8bpp using the palette
-        // we provide below.
-        WICPixelFormatGUID fmt = GUID_WICPixelFormat8bppIndexed;
-        hr = frame->SetPixelFormat(&fmt);
-        // fmt is updated to what the encoder actually accepted — verify:
-        if (fmt != GUID_WICPixelFormat8bppIndexed)
-        {
-            // Encoder didn't accept 8bpp — fall back to 24bpp (still PNG, just larger)
-            std::wcout << L"[ScreenshotModule] 8bpp not supported by encoder, using 24bpp\n";
-        }
-
-        // Hand the palette to the frame encoder.
-        // The encoder will use this palette when converting 24bpp pixels → 8bpp indices.
-        hr = frame->SetPalette(palette);
-        if (FAILED(hr)) { std::cerr << "[ScreenshotModule] SetPalette failed\n"; return; }
-
-        // Write pixels — WIC reads from the IWICBitmap and converts on the fly.
-        // WriteSource handles the format conversion (24bpp RGB → 8bpp indexed)
-        // and dithering internally using Floyd-Steinberg error diffusion.
-        hr = frame->WriteSource(wicBmp, nullptr); // nullptr = entire bitmap
-        if (FAILED(hr))
-        {
-            std::cerr << "[ScreenshotModule] WriteSource failed, hr="
-                << std::hex << hr << "\n";
-            return;
-        }
-
-        // Commit the frame, then the encoder (flushes to the IStream)
-        hr = frame->Commit();
-        if (FAILED(hr)) { std::cerr << "[ScreenshotModule] Frame Commit failed\n"; return; }
-
-        hr = encoder->Commit();
-        if (FAILED(hr)) { std::cerr << "[ScreenshotModule] Encoder Commit failed\n"; return; }
-
-        std::wcout << L"[ScreenshotModule] Saved " << path << L"\n";
+        ::CloseHandle(hf);
     }
 };
 

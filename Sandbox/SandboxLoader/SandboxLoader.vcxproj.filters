@@ -18,6 +18,9 @@
     <ClCompile Include="SandboxLoader.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="Include\SandboxLoader\Dependencies\miniz.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Include\SandboxLoader\CollectorModules\ClipboardModule.h">
@@ -33,6 +36,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="Include\SandboxLoader\Modules\ModuleRegistry.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Include\SandboxLoader\Containers\SshotContainer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Include\SandboxLoader\Dependencies\miniz.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

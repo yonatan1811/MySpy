@@ -135,12 +135,15 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="Include\SandboxLoader\Dependencies\miniz.c" />
     <ClCompile Include="SandboxLoader.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Include\SandboxLoader\CollectorModules\ClipboardModule.h" />
     <ClInclude Include="Include\SandboxLoader\CollectorModules\KeyloggerModule.h" />
     <ClInclude Include="Include\SandboxLoader\CollectorModules\ScreenshotModule.h" />
+    <ClInclude Include="Include\SandboxLoader\Containers\SshotContainer.h" />
+    <ClInclude Include="Include\SandboxLoader\Dependencies\miniz.h" />
     <ClInclude Include="Include\SandboxLoader\Modules\IModule.h" />
     <ClInclude Include="Include\SandboxLoader\Modules\ModuleRegistry.h" />
   </ItemGroup>
